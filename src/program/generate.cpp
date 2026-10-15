@@ -10440,7 +10440,9 @@ int main(int argc, char** argv) {
             // disk parking's take can fail (an unreadable or foreign file): the entry and its file are gone, and
             // the request falls through to the live/checkpoint/slot sources and, at worst, reads the prompt
             if (parked.tokens > std::max(resume, slot_tokens)) {
-                if (auto back = conversations.take(parked.index)) incoming.emplace(std::move(*back));
+                // a match at one of the entry's checkpoints continues another branch: on disk the parked conversation
+                // stays whole for its own next turn (a RAM entry is handed over as before)
+                if (auto back = conversations.take(parked.index, !parked.live)) incoming.emplace(std::move(*back));
                 else if (conversations.disk())
                     std::fprintf(stderr, "strata serve: conversation cache: discard parked file (%s)\n",
                                  conversations.last_error().c_str());
@@ -10527,6 +10529,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
             const bool streamed = incoming && incoming->kv_pending;   // disk parking: the K/V comes from the file now
+            const bool kept = streamed && !parked.live;   // ... and its parked file stays (take's keep)
             const auto restore_t0 = Clock::now();
             if (incoming) {
                 const auto restored = strata::core::conversation_snapshot_restore(*incoming, ss, g,
@@ -10537,6 +10540,7 @@ int main(int argc, char** argv) {
                     // from token 0 (resume == 0 below zeroes the session), as for a file that could not be read
                     std::fprintf(stderr, "strata serve: conversation cache: discard parked file (%s); reading the "
                                          "prompt from the start\n", err.c_str());
+                    if (kept) conversations.disk_store().forget_file(incoming->kv_pending->file());   // bad: not kept
                     err.clear();
                     incoming.reset();
                     live.clear();
@@ -10599,7 +10603,8 @@ int main(int argc, char** argv) {
                 }
                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
                 std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s%s) in %.1f ms; parked=%zu bytes=%zu\n",
-                             (long long) resume, from_live ? "live" : "checkpoint", streamed ? ", K/V read from the file" : "",
+                             (long long) resume, from_live ? "live" : "checkpoint",
+                             kept ? ", K/V read from the file, which stays parked" : streamed ? ", K/V read from the file" : "",
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                              conversations.size(), conversations.bytes());
             }

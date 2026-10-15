@@ -80,6 +80,8 @@ struct ConversationKvPending {
     virtual bool file_failed() const = 0;
     /// The file is removed when this is destroyed (after it is closed): the disk cache's entry is gone already.
     virtual void remove_file_when_done() = 0;
+    /// The file being read (the disk cache finds its entry by it).
+    virtual const std::string& file() const = 0;
 };
 
 struct ConversationKvReuse {
