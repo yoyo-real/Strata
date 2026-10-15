@@ -314,6 +314,23 @@ int main() {
         check(!c.last_error().empty(), "the refusal says why");
     }
 
+    // ---- keep (a match at a checkpoint): the file and the entry stay, now the most recently used
+    {
+        ConversationDiskCache c(64u << 20, 4, 0, d);
+        c.io(plain_io());
+        const SavedConversation a = sample(40, 64), b = sample(41, 64);
+        check(c.put(SavedConversation(a)) && c.put(SavedConversation(b)), "park two for keep");
+        const size_t file = dir_bytes(dir), booked = c.bytes();
+        auto back = c.take(0, true);
+        check(back.has_value() && same(*back, a), "kept take reads the same");
+        check(c.size() == 2 && c.bytes() == booked && dir_bytes(dir) == file, "the kept entry and its file stay booked");
+        // it is the most recently used now: the next eviction takes b, not a
+        check(c.evict_oldest() && c.size() == 1, "evict the oldest");
+        auto again = c.take(0);
+        check(again.has_value() && same(*again, a), "the kept one survived the eviction");
+        check(dir_bytes(dir) == 0 && c.size() == 0, "an ordinary take still removes it");
+    }
+
     fs::remove_all(dir);
     std::printf("conversation_disk_test: %d checks OK\n", checks);
     return 0;

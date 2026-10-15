@@ -10380,7 +10380,9 @@ int main(int argc, char** argv) {
             // disk parking's take can fail (an unreadable or foreign file): the entry and its file are gone, and
             // the request falls through to the live/checkpoint/slot sources and, at worst, reads the prompt
             if (parked.tokens > std::max(resume, slot_tokens)) {
-                if (auto back = conversations.take(parked.index)) incoming.emplace(std::move(*back));
+                // a match at one of the entry's checkpoints continues another branch: on disk the parked conversation
+                // stays whole for its own next turn (a RAM entry is handed over as before)
+                if (auto back = conversations.take(parked.index, !parked.live)) incoming.emplace(std::move(*back));
                 else if (conversations.disk())
                     std::fprintf(stderr, "strata serve: conversation cache: discard parked file (%s)\n",
                                  conversations.last_error().c_str());
@@ -10521,7 +10523,8 @@ int main(int argc, char** argv) {
                 }
                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
                 std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu\n",
-                             (long long) resume, from_live ? "live" : "checkpoint",
+                             (long long) resume,
+                             from_live ? "live" : conversations.disk() ? "checkpoint, the parked file stays" : "checkpoint",
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                              conversations.size(), conversations.bytes());
             }

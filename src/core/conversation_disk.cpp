@@ -86,7 +86,7 @@ size_t ConversationDiskCache::drop_superseded(const std::vector<int32_t>& ids,
     return dropped;
 }
 
-std::optional<SavedConversation> ConversationDiskCache::take(size_t index) {
+std::optional<SavedConversation> ConversationDiskCache::take(size_t index, bool keep) {
     if (index >= entries_.size()) return std::nullopt;
     Entry e = std::move(entries_[index]);
     entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
@@ -103,7 +103,12 @@ std::optional<SavedConversation> ConversationDiskCache::take(size_t index) {
         unlink_file(e.path);   // unreadable: gone for good, the caller reads the prompt again
         return std::nullopt;
     }
-    unlink_file(e.path);       // restored: the conversation is live again, its parked file goes
+    if (keep) {   // the parked conversation stays whole: back in the index as the most recently used
+        bytes_ += e.bytes;
+        entries_.push_back(e);
+    } else {
+        unlink_file(e.path);   // restored: the conversation is live again, its parked file goes
+    }
     // the pin marks are run-time only - the file does not carry them (conversation_file.hpp), so the index's do
     for (const auto& m : e.checkpoints)
         for (auto& c : image.checkpoints)

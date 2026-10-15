@@ -85,7 +85,12 @@ public:
     // Reads the entry's file back (through the installed io).  The entry and its file leave the cache either way:
     // a file that cannot be read is gone for good, `last_error()` says why, and the caller falls back to reading the
     // prompt - the same recoverable miss a discarded invalid snapshot is in the RAM path.
-    std::optional<SavedConversation> take(size_t index);
+    //
+    // `keep`: the request resumes at one of the entry's checkpoints, not at its live state, so it continues another
+    // branch and the parked conversation is still whole.  A file read leaves it as it was: the entry stays parked
+    // (now the most recently used), only a file that cannot be read goes.  A RAM image would have to be copied for
+    // this; a file costs nothing to keep.
+    std::optional<SavedConversation> take(size_t index, bool keep = false);
     const std::string& last_error() const { return last_error_; }
 
     // The disk budget's make_room: the same shape as the RAM one.  `held` is IGNORED: in the RAM cache it counts the
@@ -192,8 +197,9 @@ public:
     }
     // The RAM take never fails; a disk take can (an unreadable file), so both return optional and the caller falls
     // back to reading the prompt when there is nothing to restore.
-    std::optional<SavedConversation> take(size_t index) {
-        if (disk_) return disk_->take(index);
+    // `keep_file`: disk only (ConversationDiskCache::take); the RAM store always hands its image over
+    std::optional<SavedConversation> take(size_t index, bool keep_file = false) {
+        if (disk_) return disk_->take(index, keep_file);
         return ram_->take(index);
     }
     const std::string& last_error() const { return disk_ ? disk_->last_error() : empty_; }
