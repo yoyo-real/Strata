@@ -90,7 +90,15 @@ public:
     // a file that cannot be read is gone for good, `last_error()` says why, and the caller falls back to reading the
     // prompt - the same recoverable miss a discarded invalid snapshot is in the RAM path.  An io that leaves the K/V
     // in the file (kv_pending) hands the file over with it: it is removed when the image's K/V has been read.
-    std::optional<SavedConversation> take(size_t index);
+    //
+    // `keep`: the request resumes at one of the entry's checkpoints, not at its live state, so it continues another
+    // branch and the parked conversation is still whole.  A file read leaves it as it was: the entry stays parked
+    // (now the most recently used), only a file that cannot be read goes.  A RAM image would have to be copied for
+    // this; a file costs nothing to keep.
+    std::optional<SavedConversation> take(size_t index, bool keep = false);
+    // A kept entry whose file turned out bad while its K/V was streamed (ConversationRestore::file_failed): it goes,
+    // so the next match does not fail the same way.  Returns whether an entry had that file.
+    bool forget_file(const std::string& path);
     const std::string& last_error() const { return last_error_; }
 
     // The disk budget's make_room: the same shape as the RAM one.  `held` is IGNORED: in the RAM cache it counts the
@@ -122,6 +130,9 @@ private:
         bool cvec = true;
         std::string path;
         size_t bytes = 0;
+        // a kept entry whose file is open for a restore right now: evicting it removes the file once that read closes
+        // it (a file still open cannot be removed on Windows)
+        std::weak_ptr<ConversationKvPending> reading;
         bool pinned() const {
             for (const auto& c : checkpoints)
                 if (c.pinned) return true;
@@ -138,6 +149,10 @@ private:
     }
     std::string next_path();
     void unlink_file(const std::string& path) { std::remove(path.c_str()); }
+    void remove_file(const Entry& e) {
+        if (auto open = e.reading.lock()) open->remove_file_when_done();
+        else unlink_file(e.path);
+    }
 
     size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0;
     int64_t min_tokens_ = 0;
@@ -205,8 +220,9 @@ public:
     }
     // The RAM take never fails; a disk take can (an unreadable file), so both return optional and the caller falls
     // back to reading the prompt when there is nothing to restore.
-    std::optional<SavedConversation> take(size_t index) {
-        if (disk_) return disk_->take(index);
+    // `keep_file`: disk only (ConversationDiskCache::take); the RAM store always hands its image over
+    std::optional<SavedConversation> take(size_t index, bool keep_file = false) {
+        if (disk_) return disk_->take(index, keep_file);
         return ram_->take(index);
     }
     const std::string& last_error() const { return disk_ ? disk_->last_error() : empty_; }

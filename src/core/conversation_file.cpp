@@ -1307,6 +1307,7 @@ public:
     size_t layers() const override { return (size_t) layers_; }
     bool file_failed() const override { return file_failed_; }
     void remove_file_when_done() override { remove_ = true; }
+    const std::string& file() const override { return path_; }
     bool read(const ConversationKvSink& sink, std::string& error) override {
         error.clear();
         file_failed_ = true;

@@ -499,6 +499,61 @@ int main() {
         check(!small.put_streamed(meta, kv) && dir_bytes(dir) == 0, "over the budget (the K/V counted): refused");
     }
 
+    // ---- keep (a match at a checkpoint): the file and the entry stay, now the most recently used; a plain read too
+    {
+        ConversationDiskCache c(256u << 20, 4, 0, d);
+        c.io(streamed_io());
+        const SavedConversation a = sample(40, 64), b = sample(41, 64);
+        check(c.put(SavedConversation(a)) && c.put(SavedConversation(b)), "park two for keep");
+        const size_t file = dir_bytes(dir), booked = c.bytes();
+        {
+            auto back = c.take(0, true);
+            check(back.has_value() && back->kv_pending, "kept take reads");
+            check(c.size() == 2 && c.bytes() == booked, "the kept entry stays booked");
+            Collect got;
+            std::string error;
+            check(back->kv_pending->read(got.sink(), error), "kept take streams its K/V");
+        }
+        check(dir_bytes(dir) == file, "the kept file is still there once read");
+        // it is the most recently used now: the next eviction takes b, not a
+        check(c.evict_oldest() && c.size() == 1, "evict the oldest");
+        auto again = c.take(0);
+        check(again.has_value() && again->live.ids == a.live.ids, "the kept one survived the eviction");
+        again.reset();
+        check(dir_bytes(dir) == 0 && c.size() == 0, "an ordinary take still removes it");
+
+        c.io(plain_io());
+        check(c.put(SavedConversation(a)), "park for a plain kept read");
+        auto whole = c.take(0, true);
+        check(whole.has_value() && same(*whole, a) && c.size() == 1 && dir_bytes(dir) > 0, "a plain read keeps it too");
+        c.clear();
+        check(dir_bytes(dir) == 0, "clear removes it");
+    }
+
+    // ---- a kept entry evicted while its file is open: the file goes when the read closes it; forget_file drops a bad one
+    {
+        ConversationDiskCache c(256u << 20, 4, 0, d);
+        c.io(streamed_io());
+        check(c.put(sample(42, 64)), "park for the open-file eviction");
+        auto back = c.take(0, true);
+        check(back.has_value() && c.size() == 1, "kept, file open");
+        check(c.evict_oldest() && c.size() == 0, "evicted while open");
+        check(dir_bytes(dir) > 0, "the open file is not removed yet");
+        Collect got;
+        std::string error;
+        check(back->kv_pending->read(got.sink(), error), "the read still completes");
+        back.reset();
+        check(dir_bytes(dir) == 0, "removed once the read closed it");
+
+        check(c.put(sample(43, 64)), "park for forget_file");
+        back = c.take(0, true);
+        const std::string path = back->kv_pending->file();
+        check(c.forget_file(path) && c.size() == 0 && c.bytes() == 0, "forget_file drops the entry");
+        check(!c.forget_file(path), "only once");
+        back.reset();
+        check(dir_bytes(dir) == 0, "and its file, once closed");
+    }
+
     fs::remove_all(dir);
     std::printf("conversation_disk_test: %d checks OK\n", checks);
     return 0;

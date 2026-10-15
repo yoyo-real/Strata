@@ -43,7 +43,7 @@ bool ConversationDiskCache::make_room(size_t incoming, size_t held) {
 bool ConversationDiskCache::evict_oldest() {
     auto victim = std::find_if(entries_.begin(), entries_.end(), [](const Entry& e) { return !e.pinned(); });
     if (victim == entries_.end()) return false;
-    unlink_file(victim->path);
+    remove_file(*victim);
     bytes_ -= victim->bytes;
     entries_.erase(victim);
     ++evictions_;
@@ -52,7 +52,7 @@ bool ConversationDiskCache::evict_oldest() {
 
 size_t ConversationDiskCache::clear() {
     const size_t n = entries_.size();
-    for (const auto& e : entries_) unlink_file(e.path);
+    for (const auto& e : entries_) remove_file(e);
     entries_.clear();
     bytes_ = 0;
     return n;
@@ -74,7 +74,7 @@ size_t ConversationDiskCache::drop_superseded(const std::vector<int32_t>& ids,
         for (const auto& c : e.checkpoints)
             if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
         if (e.cvec == cvec && deepest && !deepest->ids.empty() && held(*deepest)) {
-            unlink_file(e.path);
+            remove_file(e);
             bytes_ -= e.bytes;
             entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
             ++dropped;
@@ -86,7 +86,7 @@ size_t ConversationDiskCache::drop_superseded(const std::vector<int32_t>& ids,
     return dropped;
 }
 
-std::optional<SavedConversation> ConversationDiskCache::take(size_t index) {
+std::optional<SavedConversation> ConversationDiskCache::take(size_t index, bool keep) {
     if (index >= entries_.size()) return std::nullopt;
     Entry e = std::move(entries_[index]);
     entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
@@ -96,21 +96,39 @@ std::optional<SavedConversation> ConversationDiskCache::take(size_t index) {
     last_error_.clear();
     if (!io_.read) {
         last_error_ = "no read hook installed";
-        unlink_file(e.path);
+        remove_file(e);
         return std::nullopt;
     }
     if (!io_.read(e.path, image, file_bytes, last_error_)) {
-        unlink_file(e.path);   // unreadable: gone for good, the caller reads the prompt again
+        remove_file(e);   // unreadable: gone for good, the caller reads the prompt again
         return std::nullopt;
     }
-    // restored: the conversation is live again, its parked file goes - once its K/V is read, when it was left there
-    if (image.kv_pending) image.kv_pending->remove_file_when_done();
-    else unlink_file(e.path);
+    if (keep) {   // the parked conversation stays whole: back in the index as the most recently used
+        e.reading = image.kv_pending;
+        bytes_ += e.bytes;
+        entries_.push_back(e);
+    } else if (image.kv_pending) {
+        // restored: the conversation is live again, its parked file goes - once its K/V is read
+        image.kv_pending->remove_file_when_done();
+    } else {
+        unlink_file(e.path);
+    }
     // the pin marks are run-time only - the file does not carry them (conversation_file.hpp), so the index's do
     for (const auto& m : e.checkpoints)
         for (auto& c : image.checkpoints)
             if (c.ids == m.ids && c.imgs == m.imgs) c.pinned = m.pinned;
     return image;
+}
+
+bool ConversationDiskCache::forget_file(const std::string& path) {
+    for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+        if (it->path != path) continue;
+        remove_file(*it);
+        bytes_ -= it->bytes;
+        entries_.erase(it);
+        return true;
+    }
+    return false;
 }
 
 bool ConversationDiskCache::put(SavedConversation&& image, size_t held) {
