@@ -27,10 +27,14 @@
 namespace strata::core {
 
 // One snapshot's file side.  `write` streams `image` to `path` (a session-format file); `read` parses `path` back
-// into `image`.  Both report their bytes through `bytes`; `error` says why a failure happened.
+// into `image`, or all but its K/V (session_file_read_streamed: image.kv_pending).  Both report their bytes through
+// `bytes`; `error` says why a failure happened.
 struct ConversationDiskIo {
     std::function<bool(const std::string& path, const SavedConversation& image, size_t& bytes, std::string& error)> write;
     std::function<bool(const std::string& path, SavedConversation& image, size_t& bytes, std::string& error)> read;
+    // put_streamed's write: `meta` without its K/V, which `kv` reads off the device as the file is written
+    std::function<bool(const std::string& path, const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
+                       size_t& bytes, std::string& error)> write_sources;
 };
 
 class ConversationDiskCache {
@@ -84,7 +88,8 @@ public:
 
     // Reads the entry's file back (through the installed io).  The entry and its file leave the cache either way:
     // a file that cannot be read is gone for good, `last_error()` says why, and the caller falls back to reading the
-    // prompt - the same recoverable miss a discarded invalid snapshot is in the RAM path.
+    // prompt - the same recoverable miss a discarded invalid snapshot is in the RAM path.  An io that leaves the K/V
+    // in the file (kv_pending) hands the file over with it: it is removed when the image's K/V has been read.
     std::optional<SavedConversation> take(size_t index);
     const std::string& last_error() const { return last_error_; }
 
@@ -104,6 +109,10 @@ public:
     // caller's copy is freed (put clears it here), so a parked conversation holds no host RAM beyond its index.
     // `held` is ignored as in make_room.  false: the budget refused it, or the write failed (the caller logs).
     bool put(SavedConversation&& image, size_t held = 0);
+    // The same park with the K/V never on the host: `meta` holds everything else (meta.kv empty), `kv` reads each
+    // layer off the device into the file's write buffer.  `meta` is left to the caller, whose checkpoints it may
+    // hold on loan (conversation_snapshot_park_sources).
+    bool put_streamed(const SavedConversation& meta, const std::vector<SessionKvSource>& kv);
 
 private:
     // The RAM index of one parked file: the matching metadata (ids, image keys, pins), not one K/V byte.
@@ -184,6 +193,10 @@ public:
     }
     bool put(SavedConversation&& image, size_t held = 0) {
         return disk_ ? disk_->put(std::move(image), held) : ram_->put(std::move(image), held);
+    }
+    // disk only: the RAM store has nowhere to put a K/V it does not hold
+    bool put_streamed(const SavedConversation& meta, const std::vector<SessionKvSource>& kv) {
+        return disk_ && disk_->put_streamed(meta, kv);
     }
     template<class Token>
     ConversationCache::Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images,

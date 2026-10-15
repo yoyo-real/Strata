@@ -174,6 +174,48 @@ void full_session(int fmt, int mode, int experts) {
               x.checkpoints.size()==y.checkpoints.size() && equal(x.kv[0],y.kv[0]) && equal(x.kv.back(),y.kv.back()),
               "streamed file equals captured file");
         check(slurp(p1)==slurp(p2),"streamed file is byte-identical to the captured file");
+        {
+            // disk parking's capture: the checkpoints lent to the write, not copied, and the same file again
+            auto lent=checkpoints;
+            const ConversationView lv{ids,images,lent,true};
+            SavedConversation pm;
+            std::vector<SessionKvSource> ps;
+            check(conversation_snapshot_park_sources(pm,ps,lv,lent,ss,g,&draft.state,err) && lent.empty() &&
+                  pm.checkpoints.size()==checkpoints.size() && pm.kv.empty() && ps.size()==b.kv.size(),
+                  "park sources: checkpoints moved in, one source per K/V layer");
+            const std::string p4=(dir/"parked.bin").string();
+            size_t n4=0;
+            check(session_file_write(p4,pm,ps,id,n4,err) && slurp(p4)==slurp(p2),"park sources write the captured file");
+            lent=std::move(pm.checkpoints);
+            check(lent.size()==checkpoints.size() && lent[0].gdn==checkpoints[0].gdn,"the checkpoints come back whole");
+            SavedConversation nm;
+            std::vector<SessionKvSource> ns;
+            check(conversation_snapshot_park_sources(nm,ns,lv,lent,ss,g,nullptr,err) && ns.size()+1==b.kv.size(),
+                  "park sources without a draft layer");
+            lent=std::move(nm.checkpoints);
+            check(!conversation_snapshot_park_sources(nm,ns,view,lent,ss,g,&draft.state,err) && lent.size()==checkpoints.size(),
+                  "a view over other checkpoints is refused, nothing moved");
+        }
+        // disk parking's restore: the K/V read from the file straight into the pools (state A first, so B must come
+        // from the file); a file that went bad in its K/V is told apart, and the good one then restores whole
+        check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"state A before the streamed restore");
+        const std::string p3=(dir/"damaged.bin").string();
+        {
+            auto bytes=slurp(p2);
+            bytes[bytes.size()-16-1]^=0x5a;   // the payload's last byte: the draft layer's K/V
+            std::ofstream(p3,std::ios::binary).write(bytes.data(),(std::streamsize)bytes.size());
+        }
+        SavedConversation damaged,streamed,back;
+        check(session_file_read_streamed(p3,id,damaged,n1,err) && damaged.kv.empty() && damaged.kv_pending,
+              "the damaged file's head reads");
+        check(conversation_snapshot_restore(damaged,ss,g,draft.state,err)==ConversationRestore::file_failed,
+              "a damaged K/V is the file's failure");
+        check(session_file_read_streamed(p2,id,streamed,n2,err) && streamed.kv.empty(),"streamed read of B");
+        check(conversation_snapshot_validate(streamed,ss,g,draft.state,err),"streamed image validates without its K/V");
+        check(conversation_snapshot_restore(streamed,ss,g,draft.state,err)==ConversationRestore::restored,"streamed restore of B");
+        check(conversation_snapshot_save(back,view,ss,g,draft.state,err),"capture after the streamed restore");
+        check(back.live.gdn==b.live.gdn && back.live.dead==b.live.dead && back.live.block_pos==b.live.block_pos &&
+              equal(back.kv[0],b.kv[0]) && equal(back.kv.back(),b.kv.back()),"the streamed restore gives B exactly");
         std::error_code ec;
         fs::remove_all(dir,ec);
         auto empty_ids=std::vector<int32_t>{};

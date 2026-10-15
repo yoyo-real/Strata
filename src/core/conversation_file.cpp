@@ -602,6 +602,14 @@ public:
         }
         return true;
     }
+    // the next bytes, at most `max`, where they are in the read buffer (valid until the next read or view)
+    bool view(const uint8_t*& p, size_t& n, size_t max) {
+        if (at_ == have_ && !fill()) return false;
+        n = std::min(max, have_ - at_);
+        p = buf_.get() + at_;
+        at_ += n;
+        return true;
+    }
     std::optional<Ticker> progress;
     uint64_t expected = 0;
 private:
@@ -749,10 +757,29 @@ struct In {
         b.resize((size_t) n);
         return b.visit(0, b.size(), [&](uint8_t* p, size_t c, size_t) { return raw(p, c); });
     }
+    // `n` bytes handed to `to` where they lie in the read buffer, hashed as raw() hashes them
+    bool stream(uint64_t n, const std::function<bool(uint64_t at, const uint8_t* p, size_t c)>& to) {
+        if (n > left) return fail("payload ends early");
+        for (uint64_t at = 0; at < n;) {
+            const uint8_t* p = nullptr;
+            size_t c = 0;
+            if (!f->view(p, c, (size_t) std::min<uint64_t>(n - at, kBlock))) {
+                kind = f->kind();
+                return fail("read error: " + f->error());
+            }
+            hash.update(p, c);
+            left -= c;
+            if (!to(at, p, c)) return false;
+            at += c;
+        }
+        return true;
+    }
 };
 
-bool get_checkpoint(In& in, ConversationCheckpoint& c) {
+// `after_ids`: asked once the token ids are read, before the state arrays (the streamed read's RAM preflight)
+bool get_checkpoint(In& in, ConversationCheckpoint& c, const std::function<bool()>& after_ids = {}) {
     if (!in.vec(c.ids, in.limits.max_tokens)) return false;
+    if (after_ids && !after_ids()) return false;
     uint64_t n = 0;
     if (!in.count(n, 16, in.limits.max_tokens)) return false;
     c.imgs.resize((size_t) n);
@@ -762,7 +789,8 @@ bool get_checkpoint(In& in, ConversationCheckpoint& c) {
            in.vec(c.block_pos, m[4]) && in.u64(c.used);
 }
 
-bool get_payload(In& in, SavedConversation& s) {
+// everything before the K/V, its layer count included (`kv_layers`)
+bool get_head(In& in, SavedConversation& s, uint64_t& kv_layers, const std::function<bool()>& after_live_ids = {}) {
     for (auto& g : s.geometry) if (!in.i64(g)) return false;
     // checked before any state array is read: a file of another geometry allocates nothing
     if (in.limits.geometry && *in.limits.geometry != s.geometry)
@@ -774,24 +802,46 @@ bool get_payload(In& in, SavedConversation& s) {
         return in.fail("saved with another layer range than this runtime's");
     if (cvec > 1) return in.fail("invalid cvec flag");
     s.cvec = cvec == 1;
-    if (!get_checkpoint(in, s.live)) return false;
+    if (!get_checkpoint(in, s.live, after_live_ids)) return false;
     uint64_t n = 0;
     // a checkpoint is at least 8 counts + used = 72 bytes; a K/V layer at least 7 + 5 = 96
     if (!in.count(n, 72, in.limits.max_checkpoints)) return false;
     s.checkpoints.resize((size_t) n);
     for (auto& c : s.checkpoints) if (!get_checkpoint(in, c)) return false;
-    if (!in.count(n, 96, in.limits.max_kv_layers)) return false;
+    return in.count(kv_layers, 96, in.limits.max_kv_layers);
+}
+
+// a K/V layer's geometry fields (the bytes follow them)
+bool get_kv_header(In& in, ConversationKv& k) {
+    int64_t format = 0;
+    if (!in.i64(format) || !in.i64(k.cells) || !in.i64(k.heads) || !in.i64(k.head_dim) ||
+        !in.i64(k.page_size) || !in.i64(k.pooled_rows) || !in.i64(k.idx_dim)) return false;
+    if (format < INT32_MIN || format > INT32_MAX) return in.fail("invalid K/V format");
+    k.format = (int) format;
+    return true;
+}
+
+bool get_payload(In& in, SavedConversation& s) {
+    uint64_t n = 0;
+    if (!get_head(in, s, n)) return false;
     s.kv.resize((size_t) n);
     for (auto& k : s.kv) {
         in.kv_layer = (size_t) (&k - s.kv.data());
-        int64_t format = 0;
-        if (!in.i64(format) || !in.i64(k.cells) || !in.i64(k.heads) || !in.i64(k.head_dim) ||
-            !in.i64(k.page_size) || !in.i64(k.pooled_rows) || !in.i64(k.idx_dim)) return false;
-        if (format < INT32_MIN || format > INT32_MAX) return in.fail("invalid K/V format");
-        k.format = (int) format;
+        if (!get_kv_header(in, k)) return false;
         if (!in.buffer(k.k, 0) || !in.buffer(k.v, 1) || !in.buffer(k.k_scale, 2) || !in.buffer(k.v_scale, 3) ||
             !in.buffer(k.pooled, 4)) return false;
     }
+    return true;
+}
+
+// the trailer after the payload: its checksum and the end marker
+bool check_trailer(FileSource& f, const SessionHasher& hash, std::string& error, SessionStatus& st) {
+    uint8_t t[kTrailer];
+    if (!f.read(t, kTrailer)) { st.error = f.kind(); error = "session file: trailer read error: " + f.error(); return false; }
+    uint64_t ph = 0;
+    std::memcpy(&ph, t, 8);
+    if (ph != hash.digest()) { error = "session file: payload checksum mismatch"; return false; }
+    if (std::memcmp(t + 8, kEnd, 8) != 0) { error = "session file: bad end marker"; return false; }
     return true;
 }
 
@@ -1171,13 +1221,11 @@ bool session_file_write(const std::string& path, const SavedConversation& image,
 }
 
 namespace {
-bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
-               size_t& bytes, std::string& error, const SessionReadLimits& limits, SessionStatus& st) {
-    error.clear();
-    st = {};
-    st.error = SessionError::invalid;   // every refusal below, unless the step says otherwise
-    RawFile raw;
-    uint64_t size = 0;
+// What both reads do before the payload: open the file by its own name, check its size against the limits, read and
+// check the header and the identity.  `f` is the read buffer over `raw`, from the first block on.
+bool open_checked(const std::string& path, const SessionFileIdentity& id, const SessionReadLimits& limits,
+                  RawFile& raw, std::unique_ptr<FileSource>& f, uint64_t& size, uint64_t& payload,
+                  std::string& error, SessionStatus& st) {
     if (!raw.open_session(path, size)) {
         st.error = raw.refused() ? SessionError::invalid : raw.kind();
         error = "session file: " + path + ": " + raw.error();
@@ -1190,15 +1238,16 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
                 (max_size == UINT64_MAX ? std::string() : " of " + std::to_string(max_size));
         return false;
     }
-    FileSource f(raw);
-    if (!f.ok()) { st.error = SessionError::memory; error = "session file: " + f.error(); return false; }
+    f = std::make_unique<FileSource>(raw);
+    if (!f->ok()) { st.error = SessionError::memory; error = "session file: " + f->error(); return false; }
     // installed before the first block (the header's) is read: every block reports, the first one included
-    if (limits.progress) f.progress.emplace(limits.progress);
-    f.expected = size;
+    if (limits.progress) f->progress.emplace(limits.progress);
+    f->expected = size;
     uint8_t h[kHeader];
-    if (!f.read(h, kHeader)) { st.error = f.kind(); error = "session file: header read error: " + f.error(); return false; }
+    if (!f->read(h, kHeader)) { st.error = f->kind(); error = "session file: header read error: " + f->error(); return false; }
     uint32_t version = 0, hsize = 0;
-    uint64_t model = 0, config = 0, payload = 0, r0 = 0, r1 = 0, hh = 0;
+    uint64_t model = 0, config = 0, r0 = 0, r1 = 0, hh = 0;
+    payload = 0;
     std::memcpy(&version, h + 8, 4); std::memcpy(&hsize, h + 12, 4);
     std::memcpy(&model, h + 16, 8); std::memcpy(&config, h + 24, 8); std::memcpy(&payload, h + 32, 8);
     std::memcpy(&r0, h + 40, 8); std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
@@ -1213,6 +1262,18 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
                 std::to_string(kHeader + payload + kTrailer) + ")";
         return false;
     }
+    return true;
+}
+
+bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
+               size_t& bytes, std::string& error, const SessionReadLimits& limits, SessionStatus& st) {
+    error.clear();
+    st = {};
+    st.error = SessionError::invalid;   // every refusal below, unless the step says otherwise
+    RawFile raw;
+    std::unique_ptr<FileSource> f;
+    uint64_t size = 0, payload = 0;
+    if (!open_checked(path, id, limits, raw, f, size, payload, error, st)) return false;
     if (limits.admit) {
         std::string why;
         if (!limits.admit(session_read_peak_bytes(size), why)) {
@@ -1222,15 +1283,107 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
         }
     }
     SavedConversation parsed;
-    In in{&f, SessionHasher(0), payload, error, limits};
+    In in{f.get(), SessionHasher(0), payload, error, limits};
     if (!get_payload(in, parsed)) { st.error = in.kind; return false; }
     if (in.left) { error = "session file: payload has " + std::to_string(in.left) + " unparsed bytes"; return false; }
-    uint8_t t[kTrailer];
-    if (!f.read(t, kTrailer)) { st.error = f.kind(); error = "session file: trailer read error: " + f.error(); return false; }
-    uint64_t ph = 0;
-    std::memcpy(&ph, t, 8);
-    if (ph != in.hash.digest()) { error = "session file: payload checksum mismatch"; return false; }
-    if (std::memcmp(t + 8, kEnd, 8) != 0) { error = "session file: bad end marker"; return false; }
+    if (!check_trailer(*f, in.hash, error, st)) return false;
+    image = std::move(parsed);
+    bytes = (size_t) size;
+    st.error = SessionError::none;
+    return true;
+}
+
+// session_file_read_streamed's open file: everything before the K/V is parsed, and read() goes on from there.  The
+// limits are a copy (the parse keeps checking each K/V part against them); the file is closed before it is removed.
+class FileKvPending final : public ConversationKvPending {
+public:
+    FileKvPending(std::string path, const SessionReadLimits& limits) : path_(std::move(path)), limits_(limits) {}
+    ~FileKvPending() override {
+        in_.reset();
+        source_.reset();
+        raw_.close();
+        if (remove_) std::remove(path_.c_str());
+    }
+    size_t layers() const override { return (size_t) layers_; }
+    bool file_failed() const override { return file_failed_; }
+    void remove_file_when_done() override { remove_ = true; }
+    bool read(const ConversationKvSink& sink, std::string& error) override {
+        error.clear();
+        file_failed_ = true;
+        if (!in_ || done_) { error = "session file: its K/V was read already"; return false; }
+        done_ = true;
+        In& in = *in_;
+        auto bad = [&] { error = error_; return false; };
+        auto refused = [&] { file_failed_ = false; if (error.empty()) error = "the K/V could not be written"; return false; };
+        for (uint64_t j = 0; j < layers_; ++j) {
+            in.kv_layer = (size_t) j;
+            ConversationKv header;
+            if (!get_kv_header(in, header)) return bad();
+            if (sink.layer && !sink.layer((size_t) j, header)) return refused();
+            for (size_t part = 0; part < 5; ++part) {
+                uint64_t n = 0;
+                const uint64_t limit = j < limits_.max_kv_bytes.size() ? limits_.max_kv_bytes[(size_t) j][part] : UINT64_MAX;
+                if (!in.count(n, 1, limit)) return bad();
+                if (sink.part && !sink.part((size_t) j, part, n)) return refused();
+                bool taken = true;
+                if (!in.stream(n, [&](uint64_t at, const uint8_t* p, size_t c) {
+                        return taken = !sink.bytes || sink.bytes((size_t) j, part, at, p, c);
+                    })) return taken ? bad() : refused();
+            }
+        }
+        if (in.left) { error = "session file: payload has " + std::to_string(in.left) + " unparsed bytes"; return false; }
+        SessionStatus st;
+        if (!check_trailer(*source_, in.hash, error, st)) return false;
+        file_failed_ = false;
+        return true;
+    }
+
+    const SessionReadLimits& limits() const { return limits_; }
+
+    // filled by read_streamed_impl: the open file, its read buffer and the parse that stopped at the K/V
+    RawFile raw_;
+    std::unique_ptr<FileSource> source_;
+    std::unique_ptr<In> in_;
+    std::string error_;   // the parse's error string (In keeps a reference to it)
+    uint64_t layers_ = 0;
+
+private:
+    std::string path_;
+    SessionReadLimits limits_;
+    bool remove_ = false, done_ = false, file_failed_ = false;
+};
+
+bool read_streamed_impl(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
+                        size_t& bytes, std::string& error, const SessionReadLimits& limits, SessionStatus& st) {
+    error.clear();
+    st = {};
+    st.error = SessionError::invalid;
+    auto pending = std::make_shared<FileKvPending>(path, limits);
+    uint64_t size = 0, payload = 0;
+    if (!open_checked(path, id, pending->limits(), pending->raw_, pending->source_, size, payload, error, st))
+        return false;
+    pending->in_.reset(new In{pending->source_.get(), SessionHasher(0), payload, pending->error_, pending->limits()});
+    In& in = *pending->in_;
+    SavedConversation parsed;
+    // the RAM preflight, once the live token count says how much of the file is K/V (never held on the host)
+    bool short_of_ram = false;
+    auto admit = [&] {
+        if (!limits.admit) return true;
+        const uint64_t kv = limits.kv_bytes ? limits.kv_bytes(parsed.live.ids.size()) : 0;
+        std::string why;
+        if (limits.admit(session_read_peak_bytes(size > kv ? size - kv : 0), why)) return true;
+        short_of_ram = true;
+        pending->error_ = "session file: " + why;
+        return false;
+    };
+    uint64_t layers = 0;
+    if (!get_head(in, parsed, layers, admit)) {
+        st.error = short_of_ram ? SessionError::memory : in.kind;
+        error = pending->error_;
+        return false;
+    }
+    pending->layers_ = layers;
+    parsed.kv_pending = std::move(pending);
     image = std::move(parsed);
     bytes = (size_t) size;
     st.error = SessionError::none;
@@ -1244,6 +1397,22 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
     bool ok = false;
     try {
         ok = read_impl(path, id, image, bytes, error, limits, st);
+    } catch (const std::bad_alloc&) {
+        error = "session file: out of memory while reading " + path;
+        st.error = SessionError::memory;
+        ok = false;
+    }
+    if (status) *status = st;
+    return ok;
+}
+
+bool session_file_read_streamed(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
+                                size_t& bytes, std::string& error, const SessionReadLimits& limits,
+                                SessionStatus* status) {
+    SessionStatus st;
+    bool ok = false;
+    try {
+        ok = read_streamed_impl(path, id, image, bytes, error, limits, st);
     } catch (const std::bad_alloc&) {
         error = "session file: out of memory while reading " + path;
         st.error = SessionError::memory;

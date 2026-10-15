@@ -9,6 +9,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
+#include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -51,6 +54,32 @@ struct ConversationKv {
     size_t bytes() const {
         return k.bytes() + v.bytes() + k_scale.bytes() + v_scale.bytes() + pooled.bytes();
     }
+};
+
+/// Where a streamed K/V goes (ConversationKvPending::read): each layer's header (the geometry fields of a
+/// ConversationKv, no bytes), then each of its five parts' size (k, v, k_scale, v_scale, pooled) before that part's
+/// bytes, which arrive in file order, a block at a time.  A false return stops the read; the callee says why in the
+/// error string it was given.
+struct ConversationKvSink {
+    std::function<bool(size_t layer, const ConversationKv& header)> layer;
+    std::function<bool(size_t layer, size_t part, uint64_t bytes)> part;
+    std::function<bool(size_t layer, size_t part, uint64_t at, const uint8_t* data, size_t n)> bytes;
+};
+
+/// Disk parking: the K/V of a parked conversation that is still in its file.  Everything before it (the live state,
+/// the checkpoints) was read and checked; the K/V goes from the file straight into the session's K/V pools at
+/// restore, through one read buffer, so restoring needs no host copy of it.  The file's checksum covers the K/V too
+/// and is known only at the end of read(): by then the pools are written.
+struct ConversationKvPending {
+    virtual ~ConversationKvPending() = default;
+    /// The K/V layer count the file holds (the session's QSA layers, then the draft when it was saved with one).
+    virtual size_t layers() const = 0;
+    /// Reads every K/V layer into `sink`, then checks the payload checksum and the end marker.  Once only.  false:
+    /// `error` says why, and `file_failed()` tells a bad or unreadable file from a sink that refused.
+    virtual bool read(const ConversationKvSink& sink, std::string& error) = 0;
+    virtual bool file_failed() const = 0;
+    /// The file is removed when this is destroyed (after it is closed): the disk cache's entry is gone already.
+    virtual void remove_file_when_done() = 0;
 };
 
 struct ConversationKvReuse {
@@ -156,6 +185,8 @@ struct SavedConversation {
     bool cvec = true;
     // with a layer split, the later stages' own images, one per stage, in stage order
     std::vector<SavedConversation> stage_images;
+    // Disk parking only (session_file_read_streamed): the K/V left in the file, `kv` empty.  Null otherwise.
+    std::shared_ptr<ConversationKvPending> kv_pending;
 
     /// Holds a pinned shared prefix (see ConversationCheckpoint::pinned): the parked-conversation budget keeps it.
     bool pinned() const {

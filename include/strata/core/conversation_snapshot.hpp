@@ -34,6 +34,17 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& state, 
 // conversation_kv_save).  Caller synchronizes the device first and keeps the state untouched while it is read.
 bool conversation_kv_source(SessionKvSource& source, const QsaState& state, const ModelGeometry& g,
                             int64_t upto, bool include_index, std::string& error);
+// A K/V layer restored from its file without a host copy (disk parking, ConversationKvPending): the header is
+// checked as conversation_kv_validate checks an image's, each part's size before its bytes, and the bytes go to the
+// authoritative pools as they arrive (bounds-checked; synchronous, so the caller's buffer is free on return).  _done
+// does what conversation_kv_restore does after its copies (the VRAM residency); with upto = 0 it only drops it.
+bool conversation_kv_stream_layer(const ConversationKv& header, const QsaState& state, const ModelGeometry& g,
+                                  int64_t upto, bool include_index, std::string& error);
+bool conversation_kv_stream_part(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
+                                 size_t part, uint64_t bytes, std::string& error);
+bool conversation_kv_stream_bytes(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
+                                  size_t part, uint64_t at, const uint8_t* data, size_t n, std::string& error);
+bool conversation_kv_stream_done(const QsaState& state, const ModelGeometry& g, int64_t upto, std::string& error);
 // The bytes of each K/V part (k, v, k_scale, v_scale, pooled) a snapshot of `upto` tokens holds: no state read.
 bool conversation_kv_part_sizes(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
                                 std::array<uint64_t, 5>& sizes, std::string& error);
@@ -89,9 +100,21 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
                                    const ModelGeometry& g, const QsaState& draft, std::string& error);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState& draft, std::string& error);
-enum class ConversationRestore { restored, invalid, transfer_failed };
+// Disk parking's capture: the same as conversation_snapshot_sources, with the draft layer optional (null: no draft
+// K/V, as conversation_snapshot_save takes it) and the checkpoints MOVED from `checkpoints` (which must be the view's)
+// into `meta` instead of copied - the session's own, lent to the file write; the caller moves them back after it.
+// On failure nothing is moved.
+bool conversation_snapshot_park_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                        const ConversationView& view, std::vector<ConversationCheckpoint>& checkpoints,
+                                        const SessionState& session, const ModelGeometry& g, const QsaState* draft,
+                                        std::string& error);
+// file_failed: an image whose K/V was still in its file (kv_pending) turned out bad or unreadable while it was
+// streamed into the K/V pools.  The pools are partly written and the running state is not restored: the session
+// holds no conversation, and the caller reads the prompt from token 0 (the outgoing one was parked first).
+enum class ConversationRestore { restored, invalid, transfer_failed, file_failed };
 // Invalid images are rejected before any CUDA call/write. Transfer failure may
 // leave partial state: caller MUST NOT continue inference from that session.
+// An image with kv_pending is validated without its K/V (its layer count only); each layer is checked as it is read.
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
                                                    const ModelGeometry& g, const QsaState& draft,
                                                    std::string& error);

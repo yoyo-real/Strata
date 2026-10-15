@@ -103,7 +103,9 @@ std::optional<SavedConversation> ConversationDiskCache::take(size_t index) {
         unlink_file(e.path);   // unreadable: gone for good, the caller reads the prompt again
         return std::nullopt;
     }
-    unlink_file(e.path);       // restored: the conversation is live again, its parked file goes
+    // restored: the conversation is live again, its parked file goes - once its K/V is read, when it was left there
+    if (image.kv_pending) image.kv_pending->remove_file_when_done();
+    else unlink_file(e.path);
     // the pin marks are run-time only - the file does not carry them (conversation_file.hpp), so the index's do
     for (const auto& m : e.checkpoints)
         for (auto& c : image.checkpoints)
@@ -134,6 +136,31 @@ bool ConversationDiskCache::put(SavedConversation&& image, size_t held) {
     bytes_ += e.bytes;
     entries_.push_back(std::move(e));
     image = {};   // the snapshot's host buffers go back to the kernel: a parked conversation holds no RAM
+    return true;
+}
+
+bool ConversationDiskCache::put_streamed(const SavedConversation& meta, const std::vector<SessionKvSource>& kv) {
+    last_error_.clear();
+    size_t n = meta.bytes();
+    for (const auto& k : kv)
+        for (size_t b : k.sizes) n += b;
+    if (!enabled() || n > budget_ || !meta.kv.empty()) return false;
+    drop_superseded(meta.live.ids, meta.live.imgs, meta.checkpoints, meta.cvec);
+    if (!make_room(n)) return false;
+    Entry e;
+    e.live = meta_only(meta.live);
+    for (const auto& c : meta.checkpoints) e.checkpoints.push_back(meta_only(c));
+    e.cvec = meta.cvec;
+    e.path = next_path();
+    size_t file_bytes = 0;
+    if (!io_.write_sources) {
+        last_error_ = "no streamed write hook installed";
+        return false;
+    }
+    if (!io_.write_sources(e.path, meta, kv, file_bytes, last_error_)) return false;   // the caller logs why
+    e.bytes = file_bytes > 0 ? file_bytes : n;
+    bytes_ += e.bytes;
+    entries_.push_back(std::move(e));
     return true;
 }
 
