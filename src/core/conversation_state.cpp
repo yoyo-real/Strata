@@ -296,6 +296,30 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
     return true;
 }
 
+bool conversation_snapshot_park_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                        const ConversationView& view, std::vector<ConversationCheckpoint>& checkpoints,
+                                        const SessionState& ss, const ModelGeometry& g, const QsaState* draft,
+                                        std::string& error) {
+    if (&view.checkpoints != &checkpoints) return fail(error, "park sources: the view's checkpoints are not the ones moved");
+    if (!view_validate(view, ss, g, error) || !sync(error)) return false;
+    SavedConversation captured;
+    captured.geometry = geometry_key(g);
+    captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
+    captured.live.ids = view.ids; captured.live.imgs = view.images;
+    captured.cvec = view.cvec;
+    if (!conversation_checkpoint_save(captured.live, ss, g, error)) return false;
+    const int64_t upto = (int64_t) view.ids.size();
+    const size_t layers = owned_qsa(ss);
+    std::vector<SessionKvSource> out(layers + (draft ? 1 : 0));
+    for (size_t j = 0; j < layers; ++j)
+        if (!conversation_kv_source(out[j], owned(ss, j), g, upto, true, error)) return false;
+    if (draft && !conversation_kv_source(out.back(), *draft, g, upto, false, error)) return false;
+    captured.checkpoints = std::move(checkpoints);   // last: nothing after this can fail
+    meta = std::move(captured);
+    sources = std::move(out);
+    return true;
+}
+
 bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& ss, const ModelGeometry& g,
                                       const QsaState& draft, uint64_t max_tokens, uint64_t max_checkpoints,
                                       std::string& error) {
@@ -323,6 +347,21 @@ bool conversation_session_read_limits(SessionReadLimits& limits, const SessionSt
     }
     const int64_t dupto = (int64_t) std::min<uint64_t>(tokens, (uint64_t) std::max<int64_t>(draft.max_cells, 0));
     if (!conversation_kv_part_sizes(draft, g, dupto, false, l.max_kv_bytes.back(), error)) return false;
+    // a streamed read's RAM preflight leaves out the K/V of the session's own layers (the draft's, which a file may
+    // or may not hold, stays in: the preflight asks a little more rather than less)
+    std::vector<const QsaState*> own(layers);
+    for (size_t j = 0; j < layers; ++j) own[j] = &owned(ss, j);
+    l.kv_bytes = [own, g](uint64_t t) {
+        uint64_t n = 0;
+        std::string ignored;
+        for (const QsaState* st : own) {
+            std::array<uint64_t, 5> z{};
+            const int64_t upto = (int64_t) std::min<uint64_t>(t, (uint64_t) std::max<int64_t>(st->max_cells, 0));
+            if (!conversation_kv_part_sizes(*st, g, upto, true, z, ignored)) return uint64_t(0);
+            for (uint64_t b : z) n += b;
+        }
+        return n;
+    };
     limits = std::move(l);
     return true;
 }
@@ -338,6 +377,11 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
     const ConversationView view{image.live.ids, image.live.imgs, image.checkpoints, image.cvec};
     if (!view_validate(view, ss, g, error) || !conversation_checkpoint_validate(image.live, ss, g, error)) return false;
     const size_t layers = owned_qsa(ss);
+    if (image.kv_pending) {   // the K/V is still in its file: each layer is checked as it is streamed
+        if (!image.kv.empty() || image.kv_pending->layers() != layers + (draft ? 1 : 0))
+            return fail(error, "invalid K/V layer count");
+        return true;
+    }
     if (image.kv.size() != layers + (draft ? 1 : 0)) return fail(error, "invalid K/V layer count");
     const int64_t upto = (int64_t) image.live.ids.size();
     for (size_t j = 0; j < layers; ++j)
@@ -350,6 +394,31 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
     if (!conversation_snapshot_validate(image, ss, g, draft, error)) return ConversationRestore::invalid;
     if (!sync(error)) return ConversationRestore::transfer_failed;
     const int64_t upto = (int64_t) image.live.ids.size();
+    if (image.kv_pending) {
+        const size_t layers = owned_qsa(ss);
+        auto target = [&](size_t j) -> const QsaState& { return j < layers ? owned(ss, j) : *draft; };
+        ConversationKvSink sink;
+        sink.layer = [&](size_t j, const ConversationKv& h) {
+            return conversation_kv_stream_layer(h, target(j), g, upto, j < layers, error);
+        };
+        sink.part = [&](size_t j, size_t part, uint64_t n) {
+            return conversation_kv_stream_part(target(j), g, upto, j < layers, part, n, error);
+        };
+        sink.bytes = [&](size_t j, size_t part, uint64_t at, const uint8_t* p, size_t n) {
+            return conversation_kv_stream_bytes(target(j), g, upto, j < layers, part, at, p, n, error);
+        };
+        if (!image.kv_pending->read(sink, error)) {
+            if (!image.kv_pending->file_failed()) return ConversationRestore::transfer_failed;
+            // nothing of the outgoing conversation is left to keep: drop what VRAM holds of the pools written
+            std::string ignored;
+            for (size_t j = 0; j < layers + (draft ? 1 : 0); ++j) conversation_kv_stream_done(target(j), g, 0, ignored);
+            return ConversationRestore::file_failed;
+        }
+        for (size_t j = 0; j < layers + (draft ? 1 : 0); ++j)
+            if (!conversation_kv_stream_done(target(j), g, upto, error)) return ConversationRestore::transfer_failed;
+        return conversation_checkpoint_restore(image.live, ss, g, error) ? ConversationRestore::restored
+                                                                         : ConversationRestore::transfer_failed;
+    }
     for (size_t j = 0; j < owned_qsa(ss); ++j)
         if (!conversation_kv_restore(image.kv[j], owned(ss, j), g, upto, true, error))
             return ConversationRestore::transfer_failed;

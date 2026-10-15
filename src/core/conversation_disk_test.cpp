@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -39,6 +40,73 @@ ConversationDiskIo plain_io(uint64_t min_free_bytes = 0) {
     };
     return io;
 }
+
+// The engine's read hook (session_file_read_streamed): everything but the K/V, which stays in the file
+ConversationDiskIo streamed_io(SessionReadLimits limits = {}) {
+    ConversationDiskIo io = plain_io();
+    io.read = [limits](const std::string& path, SavedConversation& image, size_t& bytes, std::string& error) {
+        SessionStatus st;
+        return session_file_read_streamed(path, kId, image, bytes, error, limits, &st);
+    };
+    return io;
+}
+
+// The engine's streamed write hook in test form, and the K/V of `image` as sources (what the device gives the engine)
+ConversationDiskIo with_source_write(ConversationDiskIo io) {
+    io.write_sources = [](const std::string& path, const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
+                          size_t& bytes, std::string& error) {
+        SessionStatus st;
+        return session_file_write(path, meta, kv, kId, bytes, error, SessionWriteOptions{}, &st);
+    };
+    return io;
+}
+
+std::vector<SessionKvSource> sources_of(const SavedConversation& image) {
+    std::vector<SessionKvSource> out;
+    for (const auto& k : image.kv) {
+        SessionKvSource s;
+        s.format = k.format; s.cells = k.cells; s.heads = k.heads; s.head_dim = k.head_dim;
+        s.page_size = k.page_size; s.pooled_rows = k.pooled_rows; s.idx_dim = k.idx_dim;
+        const ConversationBuffer* b[5] = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+        for (size_t i = 0; i < 5; ++i) s.sizes[i] = b[i]->size();
+        s.read = [b](size_t part, size_t at, void* dst, size_t n) {
+            return b[part]->visit(at, n, [&](const uint8_t* p, size_t c, size_t off) {
+                std::memcpy(static_cast<uint8_t*>(dst) + (off - at), p, c);
+                return true;
+            });
+        };
+        out.push_back(std::move(s));
+    }
+    return out;
+}
+
+// A sink that keeps what it is given, part by part, in the image's own K/V layout
+struct Collect {
+    std::vector<ConversationKv> kv;
+    std::string error;
+    ConversationKvSink sink(size_t refuse_part = SIZE_MAX) {
+        ConversationKvSink s;
+        s.layer = [this](size_t j, const ConversationKv& h) {
+            if (j != kv.size()) { error = "layer out of order"; return false; }
+            kv.push_back(h);
+            return true;
+        };
+        s.part = [this, refuse_part](size_t j, size_t part, uint64_t n) {
+            if (part == refuse_part) { error = "refused by the test"; return false; }
+            ConversationBuffer* b[5] = {&kv[j].k, &kv[j].v, &kv[j].k_scale, &kv[j].v_scale, &kv[j].pooled};
+            b[part]->resize((size_t) n);
+            return true;
+        };
+        s.bytes = [this](size_t j, size_t part, uint64_t at, const uint8_t* p, size_t n) {
+            ConversationBuffer* b[5] = {&kv[j].k, &kv[j].v, &kv[j].k_scale, &kv[j].v_scale, &kv[j].pooled};
+            return b[part]->visit((size_t) at, n, [&](uint8_t* d, size_t c, size_t off) {
+                std::memcpy(d, p + (off - (size_t) at), c);
+                return true;
+            });
+        };
+        return s;
+    }
+};
 
 ConversationBuffer pattern(size_t n, uint8_t seed) {
     ConversationBuffer b;
@@ -312,6 +380,123 @@ int main() {
         check(!c.put(std::move(sample(17, 16))), "preflight refused");
         check(dir_bytes(dir) == 0 && c.size() == 0, "nothing written, nothing booked");
         check(!c.last_error().empty(), "the refusal says why");
+    }
+
+    // ---- streamed read (the engine's): take() reads all but the K/V; the file stays until the K/V is read, and
+    // read() hands over the same bytes, across read-buffer blocks (a 40 MiB part spans three 16 MiB blocks)
+    {
+        ConversationDiskCache c(256u << 20, 4, 0, d);
+        c.io(streamed_io());
+        const SavedConversation original = sample(20, 40 * 1024);
+        check(c.put(SavedConversation(original)), "park for the streamed read");
+        const size_t file = dir_bytes(dir);
+        {
+            auto back = c.take(0);
+            check(back.has_value() && back->kv.empty() && back->kv_pending, "streamed take: no K/V on the host");
+            check(back->kv_pending->layers() == 1, "streamed take: the layer count");
+            check(c.size() == 0 && c.bytes() == 0, "streamed take: the entry is gone from the index");
+            check(dir_bytes(dir) == file, "streamed take: the file stays until its K/V is read");
+            Collect got;
+            std::string error;
+            check(back->kv_pending->read(got.sink(), error), "streamed read");
+            check(!back->kv_pending->read(got.sink(), error), "a second read is refused");
+            SavedConversation whole = std::move(*back);
+            whole.kv = std::move(got.kv);
+            whole.kv_pending.reset();
+            check(dir_bytes(dir) == 0, "streamed take: the file goes with the pending K/V");
+            check(same(whole, original), "streamed take: the same bytes");
+        }
+        check(dir_bytes(dir) == 0, "nothing left behind");
+    }
+
+    // ---- the streamed read's RAM preflight leaves out the K/V (limits.kv_bytes), and can refuse
+    {
+        uint64_t asked = 0;
+        SessionReadLimits limits;
+        limits.admit = [&asked](uint64_t need, std::string&) { asked = need; return true; };
+        limits.kv_bytes = [](uint64_t) { return uint64_t(8u << 20) + 4096; };
+        ConversationDiskCache c(64u << 20, 4, 0, d);
+        c.io(streamed_io(limits));
+        check(c.put(sample(21, 8 * 1024)), "park for the preflight");
+        const uint64_t file = dir_bytes(dir);
+        auto back = c.take(0);
+        check(back.has_value(), "admitted");
+        check(asked == session_read_peak_bytes(file - (uint64_t(8u << 20) + 4096)), "asked for the file without its K/V");
+        back.reset();
+        limits.admit = [](uint64_t, std::string& why) { why = "test: no RAM"; return false; };
+        c.io(streamed_io(limits));
+        check(c.put(sample(22, 64)), "park for the refusal");
+        check(!c.take(0).has_value() && c.last_error().find("test: no RAM") != std::string::npos, "refused, and says why");
+        check(dir_bytes(dir) == 0, "a refused file is removed");
+    }
+
+    // ---- a file that went bad inside its K/V: take() still reads the head, read() then fails on the checksum and
+    // says it is the file's fault; a sink that refuses is told apart
+    {
+        ConversationDiskCache c(64u << 20, 4, 0, d);
+        c.io(streamed_io());
+        check(c.put(sample(23, 64)), "park for the bad file");
+        std::string path;
+        for (const auto& e : fs::directory_iterator(dir)) path = e.path().string();
+        {
+            std::fstream f(path, std::ios::in | std::ios::out | std::ios::binary);
+            f.seekp((std::streamoff) fs::file_size(path) - 16 - 4096 - 100);   // in the K/V's k part
+            char x = 0;
+            f.read(&x, 1);
+            f.seekp((std::streamoff) fs::file_size(path) - 16 - 4096 - 100);
+            x ^= 0x5a;
+            f.write(&x, 1);
+        }
+        auto back = c.take(0);
+        check(back.has_value() && back->kv_pending, "the head reads");
+        Collect got;
+        std::string error;
+        check(!back->kv_pending->read(got.sink(), error), "the K/V does not");
+        check(back->kv_pending->file_failed() && error.find("checksum") != std::string::npos, "the file's fault: checksum");
+        back.reset();
+        check(dir_bytes(dir) == 0, "the bad file is removed");
+
+        check(c.put(sample(24, 64)), "park for the refusing sink");
+        back = c.take(0);
+        Collect refusing;
+        check(!back->kv_pending->read(refusing.sink(1), error), "the sink refuses the v part");
+        check(!back->kv_pending->file_failed() && refusing.error == "refused by the test" && !error.empty(),
+              "the sink's fault, and the read says so");
+        back.reset();
+        check(dir_bytes(dir) == 0, "removed after a refused read too");
+    }
+
+    // ---- the streamed park: the K/V comes from sources, the meta stays the caller's, and the file reads back the same
+    // (whole, and streamed into a sink)
+    {
+        ConversationDiskCache c(256u << 20, 4, 0, d);
+        const SavedConversation original = sample(30, 40 * 1024);
+        SavedConversation meta = original;
+        meta.kv.clear();
+        const auto kv = sources_of(original);
+        c.io(plain_io());
+        check(!c.put_streamed(meta, kv) && !c.last_error().empty() && dir_bytes(dir) == 0, "no streamed write hook: refused");
+        c.io(with_source_write(plain_io()));
+        check(!c.put_streamed(original, kv) && c.size() == 0, "a meta that carries K/V is refused");
+        check(c.put_streamed(meta, kv) && c.size() == 1, "streamed park");
+        check(meta.checkpoints.size() == original.checkpoints.size() && meta.live.gdn == original.live.gdn,
+              "the meta is left to the caller");
+        check(c.bytes() == dir_bytes(dir), "the disk budget books the file");
+        auto back = c.take(0);
+        check(back.has_value() && same(*back, original), "a streamed park reads back the same");
+        check(c.put_streamed(meta, kv), "streamed park again");
+        c.io(with_source_write(streamed_io()));
+        back = c.take(0);
+        Collect got;
+        std::string error;
+        check(back.has_value() && back->kv_pending && back->kv_pending->read(got.sink(), error), "streamed both ways");
+        SavedConversation whole = std::move(*back);
+        whole.kv = std::move(got.kv);
+        whole.kv_pending.reset();
+        check(same(whole, original) && dir_bytes(dir) == 0, "streamed both ways: the same bytes, the file gone");
+        ConversationDiskCache small(64u << 10, 4, 0, d);
+        small.io(with_source_write(plain_io()));
+        check(!small.put_streamed(meta, kv) && dir_bytes(dir) == 0, "over the budget (the K/V counted): refused");
     }
 
     fs::remove_all(dir);

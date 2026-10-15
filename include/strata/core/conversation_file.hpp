@@ -222,6 +222,9 @@ struct SessionReadLimits {
     // parse holds at its peak (session_read_peak_bytes); false refuses the file.  Not a reservation.
     std::function<bool(uint64_t need_bytes, std::string& why)> admit;
     SessionProgress progress;
+    // session_file_read_streamed only: the K/V bytes a file whose live state holds `tokens` tokens carries, which its
+    // RAM preflight leaves out (that K/V is never held on the host).  Unset: the whole file is asked for.
+    std::function<uint64_t(uint64_t tokens)> kv_bytes;
 };
 // The largest file these limits admit (UINT64_MAX when one of them is open); session_file_read applies it.
 uint64_t session_read_max_file_bytes(const SessionReadLimits& limits);
@@ -234,6 +237,14 @@ uint64_t session_read_peak_bytes(uint64_t file_bytes);
 bool session_file_read(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
                        size_t& bytes, std::string& error, const SessionReadLimits& limits = {},
                        SessionStatus* status = nullptr);
+// Disk parking's read: the same checks, but the K/V is not read.  `image` gets everything before it and, in
+// `kv_pending`, the open file positioned at its K/V (ConversationKvPending), whose read() streams it to the session
+// and checks the payload checksum last.  The RAM preflight is asked, once the live token count is read, for the
+// file without the K/V (limits.kv_bytes) - not for the whole file as session_file_read is.  The handle and its
+// 16 MiB read buffer live as long as `kv_pending`.
+bool session_file_read_streamed(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
+                                size_t& bytes, std::string& error, const SessionReadLimits& limits = {},
+                                SessionStatus* status = nullptr);
 
 // The folder the free-space preflight asks about for `path`, by the rules of Windows or of POSIX (exposed so both can
 // be tested anywhere).  Windows: backslashes and a trailing backslash, as GetDiskFreeSpaceExW requires for a UNC
