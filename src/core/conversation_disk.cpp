@@ -473,7 +473,7 @@ bool ConversationDiskTier::store(Entry e, size_t images, const WriteFile& write_
 
 bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& out, std::string& error,
                                 const std::function<bool(uint64_t, std::string&)>& admit,
-                                const std::vector<std::vector<SessionKvTarget>>* kv) {
+                                const std::vector<std::vector<SessionKvTarget>>* kv, bool keep) {
     out = SavedConversation{};
     const auto t0 = std::chrono::steady_clock::now();
     std::unique_lock<std::mutex> lock(m_);
@@ -508,13 +508,15 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
         error = "the entry is gone (its write failed, or the budget removed it)";
         return false;
     }
-    const Entry want = entries_[index];
+    Entry want = entries_[index];
     const std::vector<std::string>& files = want.files;
     if (kv && kv->size() != files.size()) {
         error = "one set of K/V targets per file is needed";
         return false;
     }
-    remove_locked(index, false);   // the entry goes now; its files are deleted after the read, whatever it gives
+    // the entry goes now, so that no budget eviction deletes its files under the read; they are deleted after it,
+    // whatever it gives - or, with `keep` and a good read, the entry comes back as the most recently written
+    remove_locked(index, false);
     lock.unlock();
     const SessionFileIdentity fid = file_identity();
     SessionReadLimits limits;
@@ -535,9 +537,24 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
         ok = false;
         error = "the files hold another conversation than their index";
     }
-    for (const auto& f : files) remove_file(f);
+    std::string kept;   // why a kept entry could not stay (its files go then, as without `keep`)
+    if (ok && keep && options_.persist && !write_index(want, kept)) keep = false;   // a fresh index, a fresh time
+    if (!ok || !keep)
+        for (const auto& f : files) remove_file(f);
     const double ms = ms_since(t0);
     lock.lock();
+    size_t made_room = 0;
+    const size_t nfiles = files.size();
+    if (ok && keep) {   // `files` refers into `want`: not used past here
+        bytes_ += want.bytes;
+        entries_.push_back(std::move(want));
+        // the budget may have been spent while it was out of the list: the oldest go, never the one kept
+        while (entries_.size() > 1 && bytes_ > options_.budget_bytes) {
+            remove_locked(0, true);
+            ++made_room;
+        }
+        stats_.evicted += made_room;
+    }
     if (!ok) {
         ++stats_.read_failed;
         lock.unlock();
@@ -550,10 +567,13 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
     stats_.read_ms += ms - waited;
     stats_.tokens_back += (uint64_t) std::max<int64_t>(tokens, 0);
     lock.unlock();
-    log(fmt("disk hit: %lld tokens, %.0f MiB in %zu file%s, %.0f ms (%.0f MB/s)%s%s", (long long) tokens, mib(bytes),
-            files.size(), files.size() == 1 ? "" : "s", ms - waited, mbps(bytes, ms - waited),
+    log(fmt("disk hit: %lld tokens, %.0f MiB in %zu file%s, %.0f ms (%.0f MB/s)%s%s%s", (long long) tokens, mib(bytes),
+            nfiles, nfiles == 1 ? "" : "s", ms - waited, mbps(bytes, ms - waited),
             kv ? ", streamed into the GPU" : "",
-            waited > 0 ? fmt(", after %.0f ms waiting for its write", waited).c_str() : ""));
+            waited > 0 ? fmt(", after %.0f ms waiting for its write", waited).c_str() : "",
+            keep ? fmt("; a checkpoint of it: its files stay%s",
+                       made_room ? fmt(" (%zu removed for the budget)", made_room).c_str() : "").c_str()
+                 : !kept.empty() ? fmt("; its files could not stay (%s)", kept.c_str()).c_str() : ""));
     log(summary());
     return true;
 }

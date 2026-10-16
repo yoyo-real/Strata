@@ -98,16 +98,20 @@ public:
         return best;
     }
 
-    /// Hands entry `id` back in `out` (its stage images included) and removes it from the tier either way: from RAM
+    /// Hands entry `id` back in `out` (its stage images included) and removes it from the tier either way (unless `keep`): from RAM
     /// when it is still queued, else from the disk (waiting for its write when it is being written).  `admit(need,
     /// why)` is asked before each file's payload is allocated (session_file_read's RAM preflight).  `tokens` is what
     /// the request reuses (diagnostics).  On failure `out` is empty and `error` says why.
     /// With `kv` (per image, its K/V targets: conversation_snapshot_targets) the files' K/V is streamed into them
     /// instead of RAM, and `out` gets the rest; a queued entry is refused (its image is in RAM: take it without).
     /// On failure after a read began, the targets may hold part of it.
+    /// `keep`: the request resumes at one of the entry's checkpoints, not at its live state, so it continues another
+    /// branch and the conversation on the disk is still whole.  A read leaves its files (and its index) as they were
+    /// and the entry stays, now the most recently written; only files that cannot be read go.  A queued entry is
+    /// handed over as before: its image is in RAM, and keeping it would take a copy.
     bool take(uint64_t id, int64_t tokens, SavedConversation& out, std::string& error,
               const std::function<bool(uint64_t need_bytes, std::string& why)>& admit = {},
-              const std::vector<std::vector<SessionKvTarget>>* kv = nullptr);
+              const std::vector<std::vector<SessionKvTarget>>* kv = nullptr, bool keep = false);
 
     /// Whether images wait in the queue or are being written (their RAM is not back yet).
     bool pending() const;

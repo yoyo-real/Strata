@@ -334,6 +334,18 @@ int main() {
         const auto m2 = tier.best(prompt_of(450, 12000), {}, false);
         check(!tier.take(m2.id, m2.tokens, meta, e, {}, &wrong) && e.find("size differs") != std::string::npos,
               "streamed take: a K/V part of another size is refused");
+        // keep, streamed: a checkpoint match reads the K/V into the targets and leaves the files
+        const SavedConversation third = image(400, 33, 13000);
+        check(tier.put(image(400, 33, 13000)), "streamed keep: put");
+        tier.wait_idle();
+        const size_t files_before = tier_files(dir);
+        std::vector<std::array<Bytes, 5>> got3;
+        std::vector<std::vector<SessionKvTarget>> kv3 = {targets_for(third, got3)};
+        const auto m3 = tier.best([] { auto p = prompt_of(200, 13000); p.push_back(7); return p; }(), {}, false);
+        check(m3.tokens == 200 && !m3.live && tier.take(m3.id, m3.tokens, meta, e, {}, &kv3, true),
+              "streamed keep: read at a checkpoint");
+        check(got3[0][0] == bytes_of_buffer(third.kv[0].k) && tier_files(dir) == files_before && tier.size() >= 1 &&
+              tier.best(prompt_of(450, 13000), {}, false).tokens == 400, "streamed keep: the K/V read, the files stay");
     }
 
     {   // the RAM cache's evictions go to the disk tier (set_on_evict)
@@ -348,6 +360,49 @@ int main() {
         check(tier.best(prompt_of(450), {}, false).tokens == 400, "a matches on the disk");
         check(cache.best(prompt_of(450, 8000), {}, false).tokens == 400, "b stays in RAM");
     }
+
+    {   // keep: a match at a checkpoint reads the files and leaves them, the entry now the most recently written
+        uint64_t one = 0;
+        {
+            ConversationDiskTier probe(opts(dir, GiB));
+            check(probe.open(e) && probe.put(image(400, 40, 20000)), "keep: probe put");
+            probe.wait_idle();
+            one = probe.bytes();
+        }
+        ConversationDiskTier tier(opts(dir, one * 2 + one / 2));   // room for two
+        check(tier.open(e) && tier_files(dir) == 0, "keep: open");
+        const SavedConversation a = image(400, 40, 20000);
+        check(tier.put(image(400, 40, 20000)) && tier.put(image(400, 41, 21000)), "keep: put a, then b");
+        tier.wait_idle();
+        const auto at_ck = tier.best([] { auto p = prompt_of(200, 20000); p.push_back(7); return p; }(), {}, false);
+        SavedConversation back;
+        check(at_ck.tokens == 200 && !at_ck.live && tier.take(at_ck.id, at_ck.tokens, back, e, {}, nullptr, true),
+              "keep: read a at its checkpoint");
+        check(same(back, a), "keep: read back exactly");
+        check(tier.size() == 2 && tier.bytes() == 2 * one && tier_files(dir) == 2 && logged("its files stay"),
+              "keep: a's entry and files stay booked");
+        const auto whole = tier.best(prompt_of(450, 20000), {}, false);
+        check(whole.tokens == 400 && whole.live, "keep: a still matches at its live state");
+        check(tier.put(image(400, 42, 22000)), "keep: put c (over the budget: the oldest goes)");
+        tier.wait_idle();
+        check(tier.size() == 2 && tier.best(prompt_of(450, 21000), {}, false).tokens == 0 &&
+              tier.best(prompt_of(450, 20000), {}, false).tokens == 400, "keep: b went for c, not the kept a");
+        check(tier.take(whole.id, whole.tokens, back, e) && same(back, a) && tier.size() == 1 && tier_files(dir) == 1,
+              "keep: a match at the live state still takes the entry and its files");
+        // a queued entry is handed over: its image is in RAM
+        std::promise<void> release;
+        std::shared_future<void> gate = release.get_future().share();
+        auto o = opts(dir, GiB);
+        o.before_write = [gate] { gate.wait(); };
+        ConversationDiskTier held(std::move(o));
+        check(held.open(e) && held.put(image(400, 43, 23000)) && held.put(image(400, 44, 24000)), "keep: queue two");
+        const auto q = held.best([] { auto p = prompt_of(200, 24000); p.push_back(7); return p; }(), {}, false);
+        check(q.queued && held.take(q.id, q.tokens, back, e, {}, nullptr, true), "keep: a queued one is read");
+        check(held.best(prompt_of(450, 24000), {}, false).tokens == 0, "keep: a queued one is handed over");
+        release.set_value();
+    }
+    fs::remove_all(dir);
+    fs::create_directories(dir);
 
     {   // persist: the files outlive the tier, and the next tier with the same identity takes them in
         auto persistent = [&](uint64_t model) {
@@ -377,6 +432,14 @@ int main() {
             check(read, "persist: read back after a restart");
             check(same(back, split_image(500, 20)), "persist: the image is exactly the one written");
             check(tier_files(dir) == 2, "persist: its images and index are gone");
+            const auto ck = tier.best([] { auto p = prompt_of(200, 6000); p.push_back(7); return p; }(), {}, false);
+            check(ck.tokens == 200 && !ck.live && tier.take(ck.id, ck.tokens, back, e, {}, nullptr, true) &&
+                  same(back, image(400, 21, 6000)) && tier_files(dir) == 2, "persist: a kept read leaves image and index");
+        }
+        {
+            ConversationDiskTier tier(persistent(1));
+            check(tier.open(e) && tier.size() == 1 && tier.best(prompt_of(450, 6000), {}, false).tokens == 400,
+                  "persist: the kept one is taken in after a restart");
         }
         {
             ConversationDiskTier other(persistent(2));   // another model, engine version or settings

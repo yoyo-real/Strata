@@ -1065,7 +1065,11 @@ when the disk holds a longer prefix than the session, a `--batch` slot or the RA
   for again before its write started comes back from RAM, one being written is waited for, then read. A queued image
   holds its RAM until it is written: parking, and a read back, wait for the queue before they evict more;
 - `--conversation-disk-mib N` (default 32768): the files' total, oldest out first;
-- a read back removes it from the disk (the session holds it again, and it is parked again on the next switch);
+- a read back removes it from the disk (the session holds it again, and it is parked again on the next switch).
+  A request that matched one of its checkpoints rather than its live state (a shared root, an earlier turn, a
+  retry) continues another branch: the files stay on the disk for the conversation's own next turn, now the most
+  recently written (`its files stay` in the hit's line). A conversation still queued for its write is handed over
+  as before (keeping it would take a copy of its image in RAM);
 - the engine's log has a line for every queue, write, hit (from RAM or from the disk) and wait, with MiB, ms and MB/s,
   and a totals line after every hit (`strata serve: conversation disk: ...`).
 
